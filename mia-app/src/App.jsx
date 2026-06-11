@@ -66,6 +66,16 @@ const scaricaFile = (nome, contenuto, tipo) => {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 };
 
+const validaRiga = (r, incrementoId) =>
+  r.cliente && validaImporto(String(r.lordo)) !== null && validaData(r.data)
+    ? {
+        id: Date.now() + incrementoId, n: 1,
+        cliente: pulisciTesto(r.cliente, 80), data: r.data,
+        lordo: validaImporto(String(r.lordo)),
+        ritenuta: !!r.ritenuta, descr: pulisciTesto(r.descr || "", 160),
+      }
+    : null;
+
 export default function SogliaPro() {
   const [anno, setAnno] = useState(ANNO_CORRENTE);
   const [archivio, setArchivio] = useState({}); 
@@ -75,7 +85,6 @@ export default function SogliaPro() {
   const [vista, setVista] = useState("registro"); 
   const [stampaR, setStampaR] = useState(null);
   
-  // Stati di monitoraggio e crescita
   const [pro, setPro] = useState(false);
   const [emailUtente, setEmailUtente] = useState("");
   const [inputEmail, setInputEmail] = useState("");
@@ -90,7 +99,6 @@ export default function SogliaPro() {
     leggi("sogliapro:email", "").then(setEmailUtente);
   }, []);
 
-  // Sblocco sicuro via serverless function (Pronto per Stripe Webhook)
   const verificaLicenzaServer = async () => {
     if (!licenza.trim()) return setMsg("Inserisci un codice di licenza.");
     setLoading(true);
@@ -117,13 +125,12 @@ export default function SogliaPro() {
     if (!validaEmail(inputEmail)) return setMsg("Inserisci un indirizzo email valido.");
     setLoading(true);
     try {
-      // Opzionale: invia l'email al tuo database/funzione per fare marketing
       await fetch(`${API_URL}/register-lead`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: inputEmail })
       });
-    } catch(e) {} // Silenzioso per non bloccare l'utente se la rete fallisce
+    } catch(e) {}
     
     setEmailUtente(inputEmail);
     await scrivi("sogliapro:email", inputEmail);
@@ -145,7 +152,6 @@ export default function SogliaPro() {
   const salvaArchivio = (nuovo) => { setArchivio(nuovo); scrivi("sogliapro:archivio", nuovo); };
 
   const aggiungi = () => {
-    // Controllo blocchi commerciali progressivi
     if (!emailUtente && lista.length >= LIMITE_ANONIMO) {
       setVista("impostazioni");
       return setMsg(`Hai raggiunto il limite di ${LIMITE_ANONIMO} ricevute anonime. Inserisci la tua email nelle impostazioni per sbloccare gratuitamente fino a ${LIMITE_FREE} slot.`);
@@ -174,12 +180,14 @@ export default function SogliaPro() {
     setMsg("");
   };
 
-  const elimina = (id) => {
+  const物理_elimina = (id) => {
     const nl = lista.filter((r) => r.id !== id).map((r, i) => ({ ...r, n: i + 1 }));
     salvaArchivio({ ...archivio, [anno]: nl });
   };
 
   const esportaJSON = () => scaricaFile(`soglia-${anno}.json`, JSON.stringify({ anno, conf, ricevute: lista }, null, 2), "application/json");
+  const esportaBackup = () => scaricaFile(`soglia-backup-completo-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify({ tipo: "backup-completo", versione: 1, conf, archivio }, null, 2), "application/json");
+
   const esportaCSV = () => {
     const righe = [["numero", "data", "committente", "descrizione", "lordo", "ritenuta_20", "netto"]];
     lista.forEach((r) => {
@@ -195,11 +203,23 @@ export default function SogliaPro() {
       setMsg("Il pacchetto commercialista automatico è una funzione esclusiva della licenza Pro.");
       return;
     }
-    // ... Logica pacchetto esistente rimasta intatta ...
+    const sommario =
+      `RIEPILOGO PRESTAZIONI OCCASIONALI — ANNO ${anno}\n` +
+      `Generato il ${new Date().toLocaleDateString("it-IT")}\n\n` +
+      `Numero ricevute: ${lista.length}\n` +
+      `Totale lordo: ${eur(tot)}\n` +
+      `Totale ritenute 20%: ${eur(lista.reduce((s, r) => s + calc(r.lordo, r.ritenuta).rit, 0))}\n` +
+      `Totale netto: ${eur(lista.reduce((s, r) => s + calc(r.lordo, r.ritenuta).netto, 0))}\n` +
+      `Tetto annuo configurato: ${eur(capNum)} — utilizzato: ${pct.toFixed(1)}%\n\n` +
+      `DETTAGLIO:\n` +
+      lista.map((r) => {
+        const c = calc(r.lordo, r.ritenuta);
+        return `${String(r.n).padStart(2, "0")} | ${dataIT(r.data)} | ${r.cliente} | lordo ${eur(r.lordo)} | ritenuta ${eur(c.rit)} | netto ${eur(c.netto)}`;
+      }).join("\n");
+    scaricaFile(`riepilogo-commercialista-${anno}.txt`, sommario, "text/plain");
     esportaCSV();
   };
 
-  // ... [Logiche di importazione e stampa lasciate intatte per garantire continuità funzionale] ...
   const importa = (ev) => {
     const file = ev.target.files && ev.target.files[0];
     if (!file) return;
@@ -207,20 +227,68 @@ export default function SogliaPro() {
     reader.onload = () => {
       try {
         const dati = JSON.parse(reader.result);
-        if (dati.tipo === "backup-completo" && dati.archivio) {
-          salvaArchivio(dati.archivio);
-          setMsg("Backup ripristinato con successo.");
+
+        if (dati.tipo === "backup-completo" && dati.archivio && typeof dati.archivio === "object") {
+          const esistenti = Object.values(archivio).reduce((s, a) => s + a.length, 0);
+          if (esistenti > 0 && !window.confirm(`Attenzione: il ripristino sovrascriverà le ${esistenti} ricevute attuali con quelle del backup. Procedere?`)) {
+            setMsg("Ripristino annullato.");
+            return;
+          }
+          const nuovo = {};
+          let totali = 0;
+          let idCounter = 0; 
+
+          for (const [a, righe] of Object.entries(dati.archivio)) {
+            if (!Array.isArray(righe)) continue;
+            const valide = righe
+              .map((r) => { idCounter++; return validaRiga(r, idCounter); })
+              .filter(Boolean)
+              .map((r, i) => ({ ...r, n: i + 1 }));
+            if (valide.length) { nuovo[a] = valide; totali += valide.length; }
+          }
+          salvaArchivio(nuovo);
+          if (dati.conf) {
+            const iCap = parseFloat(String(dati.conf.cap).replace(",", ".")) || 5000;
+            const iBollo = parseFloat(String(dati.conf.bollo).replace(",", ".")) || 77.47;
+            const confNormalizzata = { cap: iCap, bollo: iBollo };
+            setConf(confNormalizzata);
+            scrivi("sogliapro:conf", confNormalizzata);
+          }
+          setMsg(`Backup ripristinato: ${totali} ricevute su ${Object.keys(nuovo).length} anni.`);
+          return;
         }
-      } catch (e) { setMsg("Errore di importazione."); }
+
+        if (!dati.ricevute || !Array.isArray(dati.ricevute)) throw new Error("struttura non riconosciuta");
+        let idCounterSingolo = 0;
+        const valide = dati.ricevute
+          .map((r) => { idCounterSingolo++; return validaRiga(r, idCounterSingolo); })
+          .filter(Boolean)
+          .map((r, i) => ({ ...r, n: i + 1 }));
+        const a = dati.anno || anno;
+        if ((archivio[a] || []).length > 0 && !window.confirm(`L'anno ${a} contiene già ${archivio[a].length} ricevute: verranno sostituite. Procedere?`)) {
+          setMsg("Importazione annullata.");
+          return;
+        }
+        salvaArchivio({ ...archivio, [a]: valide });
+        setAnno(a);
+        setMsg(`Importate ${valide.length} ricevute sull'anno ${a}.`);
+      } catch (e) {
+        setMsg("File non valido: " + e.message);
+      }
     };
     reader.readAsText(file);
+    ev.target.value = "";
   };
 
   const mensili = Array.from({ length: 12 }, (_, m) =>
     lista.filter((r) => parseInt(r.data.slice(5, 7), 10) === m + 1).reduce((s, r) => s + r.lordo, 0)
   );
   const max = Math.max(...mensili, 1);
-  let mesiPassati = anno === ANNO_CORRENTE ? new Date().getMonth() + 1 : 12;
+  
+  let mesiPassati = 12;
+  if (anno === ANNO_CORRENTE) mesiPassati = new Date().getMonth() + 1;
+  else if (anno > ANNO_CORRENTE) mesiPassati = 1; 
+
   const media = tot / Math.max(1, mesiPassati);
   const proiezione = anno === ANNO_CORRENTE ? media * 12 : tot;
 
@@ -246,6 +314,25 @@ export default function SogliaPro() {
             {[["registro", "Registro"], ["dashboard", "Dashboard"], ["impostazioni", "Impostazioni"]].map(([id, nome]) => (
               <button key={id} onClick={() => setVista(id)} style={{ ...stBtn(vista === id), flex: 1 }}>{nome}</button>
             ))}
+          </div>
+          <div style={{ display: "flex", gap: 6, marginTop: 8, alignItems: "center" }}>
+            <span style={{ fontSize: 12, color: T.muto }}>Anno:</span>
+            {[ANNO_CORRENTE - 1, ANNO_CORRENTE, ANNO_CORRENTE + 1].map((a) => {
+              const bloccato = !pro && a !== ANNO_CORRENTE;
+              return (
+                <button key={a}
+                  onClick={() => {
+                    if (bloccato) {
+                      setVista("impostazioni");
+                      setMsg("L'archivio pluriennale è una funzione Pro.");
+                    } else setAnno(a);
+                  }}
+                  style={{ ...stBtn(anno === a), padding: "6px 12px", fontSize: 12, opacity: bloccato ? 0.6 : 1 }}>
+                  {bloccato ? "🔒 " : ""}{a}{archivio[a] && archivio[a].length ? ` (${archivio[a].length})` : ""}
+                </button>
+              );
+            })}
+            {!pro && <span style={{ fontSize: 11, color: T.muto, marginLeft: "auto" }}>{lista.length}/{LIMITE_FREE} gratuite</span>}
           </div>
         </header>
 
@@ -276,16 +363,43 @@ export default function SogliaPro() {
                 <div><b>{r.cliente}</b> - {eur(r.lordo)}</div>
                 <div style={{display:"flex", gap: 6}}>
                   <button style={stBtn(false)} onClick={() => setStampaR(r)}>PDF</button>
-                  <button style={{ ...stBtn(false), color: T.rosso }} onClick={() => elimina(r.id)}>X</button>
+                  <button style={{ ...stBtn(false), color: T.rosso }} onClick={() => physical_elimina(r.id)}>X</button>
                 </div>
               </div>
             ))}
           </div>
         )}
 
+        {vista === "dashboard" && (
+          <div>
+            <div style={stCard}>
+              <Et c={`ANDAMENTO MENSILE ${anno}`} />
+              <div style={{ display: "flex", alignItems: "flex-end", gap: 4, height: 120 }}>
+                {mensili.map((v, i) => (
+                  <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "flex-end", height: "100%" }}>
+                    <div title={eur(v)} style={{ height: Math.max(2, (v / max) * 100) + "%", background: v > 0 ? T.oro : T.linea, borderRadius: "4px 4px 0 0" }} />
+                  </div>
+                ))}
+              </div>
+              <div style={{ display: "flex", gap: 4, marginTop: 4 }}>
+                {["G", "F", "M", "A", "M", "G", "L", "A", "S", "O", "N", "D"].map((m, i) => (
+                  <span key={i} style={{ flex: 1, textAlign: "center", fontSize: 10, color: T.muto }}>{m}</span>
+                ))}
+              </div>
+            </div>
+            <div style={stCard}>
+              <Et c="PROIEZIONE" />
+              <p style={{ fontSize: 14, color: T.testo, lineHeight: 1.7, margin: 0 }}>
+                Media mensile: <b>{eur(media)}</b><br />
+                Proiezione fine anno: <b style={{ color: proiezione > capNum ? T.rosso : T.verde }}>{eur(proiezione)}</b>
+                {proiezione > capNum && anno === ANNO_CORRENTE && <span style={{ color: T.rosso }}> — a questo ritmo sfori il tetto.</span>}
+              </p>
+            </div>
+          </div>
+        )}
+
         {vista === "impostazioni" && (
           <div>
-            {/* Sezione imbuto di conversione marketing / vendite */}
             {!emailUtente && (
               <div style={{ ...stCard, borderLeft: `4px solid ${T.verde}` }}>
                 <Et c="SBLOCCA 10 RICEVUTE GRATIS" />
@@ -314,8 +428,14 @@ export default function SogliaPro() {
             </div>
 
             <div style={stCard}>
-              <Et c="GESTIONE DATI" />
-              <button style={{ ...stBtn(false), width: "100%" }} onClick={() => fileRef.current && fileRef.current.click()}>Ripristina da File Backup</button>
+              <Et c="DATI: BACKUP, EXPORT E IMPORT" />
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                <button style={stBtn(true)} onClick={esportaBackup}>Backup completo</button>
+                <button style={stBtn(false)} onClick={() => fileRef.current && fileRef.current.click()}>Importa / Ripristina</button>
+                <button style={stBtn(false)} onClick={esportaJSON}>Esporta anno (JSON)</button>
+                <button style={stBtn(false)} onClick={esportaCSV}>Esporta anno (CSV)</button>
+                <button style={{ ...stBtn(false), gridColumn: "1 / -1" }} onClick={pacchettoCommercialista}>Pacchetto commercialista (riepilogo + CSV)</button>
+              </div>
               <input ref={fileRef} type="file" accept=".json" style={{ display: "none" }} onChange={importa} />
             </div>
           </div>
